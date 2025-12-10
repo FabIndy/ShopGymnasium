@@ -1,7 +1,7 @@
-
 # ================================================================
 # WORKSHOP ENVIRONMENT — FINAL VERSION (OPTION C, FULLY COMMENTED)
 # Production au fil de l'eau + commentaires pédagogiques complets
+# + état enrichi (23 variables) pour l'agent RL
 # ================================================================
 
 import gymnasium as gym
@@ -36,7 +36,7 @@ class WorkshopEnv(gym.Env):
     OBJECTIFS DE L'AGENT
     ---------------------
     - Produire la bonne quantité au bon moment.
-    - Minimiser le backlog (pénalité chaque minute).
+    - Minimiser le backlog (pénalité régulière).
     - Honorer la demande pour gagner des récompenses de vente.
     - Optimiser l'utilisation des machines et des stocks.
 
@@ -49,7 +49,7 @@ class WorkshopEnv(gym.Env):
     5) Demande + ventes (toutes les 15 minutes)
     6) Vol nocturne (1 fois par jour)
     7) Pénalité backlog
-    8) Construction de l'observation
+    8) Construction de l'observation (23 dimensions)
     """
 
     metadata = {"render_modes": ["human"]}
@@ -81,17 +81,70 @@ class WorkshopEnv(gym.Env):
         self.market = Market()
 
         # -----------------------------------------------------------
-        # ESPACE D'OBSERVATION (13 DIMENSIONS)
+        # VARIABLES SUPPLÉMENTAIRES POUR L'ÉTAT RL
         # -----------------------------------------------------------
-        low = np.zeros(13, dtype=np.float32)
+        # Action courante
+        self.current_action_type = 4      # 0=P1(M1), 1=P2_STEP1(M1), 2=P2_STEP2(M2),
+                                          # 3=commande MP, 4=WAIT (par défaut)
+        self.current_action_k = 0         # nombre d'unités lancées / commandées (0..50)
+        self.current_action_id = 200      # index d'action (0..200, 200=WAIT)
+
+        # Rewards dérivés pour l'observation
+        self.week_reward = 0.0           # reward cumulé depuis le début de l'épisode
+        self.reward_current_action = 0.0 # reward du dernier step
+
+        # -----------------------------------------------------------
+        # ESPACE D'OBSERVATION (23 DIMENSIONS)
+        # -----------------------------------------------------------
+        #  0 : time
+        #  1 : m1.busy
+        #  2 : m1.time_left
+        #  3 : m2.busy
+        #  4 : m2.time_left
+        #  5 : stock.raw
+        #  6 : stock.p1
+        #  7 : stock.p2_inter
+        #  8 : stock.p2
+        #  9 : next_delivery_countdown
+        # 10 : backlog_p1 (demande_p1)
+        # 11 : backlog_p2 (demande_p2)
+        # 12 : q_total_en_route
+        # 13 : current_action_type
+        # 14 : current_action_k
+        # 15 : current_action_id
+        # 16 : minute_of_day (time % 1440)
+        # 17 : expected_dem_p1_next ≈ 2 * backlog_p1
+        # 18 : expected_dem_p2_next ≈ 20 * backlog_p2
+        # 19 : theft_risk_level (0 ou 1)
+        # 20 : reward_current_week (cumul depuis début épisode)
+        # 21 : reward_current_action (reward du dernier step)
+        # 22 : time_to_next_sell (minutes avant prochaine vente)
+        low = np.zeros(23, dtype=np.float32)
         high = np.array([
-            float(self.max_time),  # minute courante
-            1.0, 100.0,            # état M1
-            1.0, 100.0,            # état M2
-            float(self.raw_capacity), float(self.raw_capacity),
-            float(self.raw_capacity), float(self.raw_capacity),
-            10080.0,               # délai prochaine livraison
-            1000.0, 1000.0, 1000.0 # backlog + MP en transit
+            float(self.max_time),          # 0: time
+            1.0,                           # 1: m1.busy (0 ou 1)
+            100.0,                         # 2: m1.time_left (bornes larges)
+            1.0,                           # 3: m2.busy
+            100.0,                         # 4: m2.time_left
+            float(self.raw_capacity),      # 5: stock.raw
+            float(self.raw_capacity),      # 6: stock.p1
+            float(self.raw_capacity),      # 7: stock.p2_inter
+            float(self.raw_capacity),      # 8: stock.p2
+            10080.0,                       # 9: next_delivery_countdown
+            1000.0,                        # 10: backlog_p1
+            1000.0,                        # 11: backlog_p2
+            1000.0,                        # 12: q_total_en_route
+
+            4.0,                           # 13: current_action_type (0..4)
+            50.0,                          # 14: current_action_k (0..50)
+            200.0,                         # 15: current_action_id (0..200)
+            1439.0,                        # 16: minute_of_day (0..1439)
+            2000.0,                        # 17: expected_dem_p1_next (≈ 2*backlog_p1)
+            20000.0,                       # 18: expected_dem_p2_next (≈ 20*backlog_p2)
+            1.0,                           # 19: theft_risk_level
+            1_000_000.0,                   # 20: reward_current_week (bornes très larges)
+            100_000.0,                     # 21: reward_current_action
+            15.0                           # 22: time_to_next_sell (0..15)
         ], dtype=np.float32)
 
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
@@ -122,6 +175,13 @@ class WorkshopEnv(gym.Env):
         self.delivery.reset()
         self.market = Market()
 
+        # Reset des variables supplémentaires d'état
+        self.current_action_type = 4
+        self.current_action_k = 0
+        self.current_action_id = 200
+        self.week_reward = 0.0
+        self.reward_current_action = 0.0
+
         return self._get_obs(), {}
 
     # ================================================================
@@ -130,17 +190,21 @@ class WorkshopEnv(gym.Env):
     def get_action_mask(self):
         mask = np.ones(201, dtype=bool)
 
+        # Si M1 est occupée, on interdit toutes les actions qui la sollicitent
         if self.m1.busy:
-            mask[0:100] = False
+            mask[0:100] = False  # P1 et P2_STEP1
 
+        # Si M2 est occupée, on interdit toutes les actions qui la sollicitent
         if self.m2.busy:
-            mask[100:150] = False
+            mask[100:150] = False  # P2_STEP2
 
+        # Contraintes en matières premières pour M1
         for a in range(0, 100):
             k = (a + 1) if a < 50 else (a - 49)
             if self.stock.raw < k:
                 mask[a] = False
 
+        # Contraintes en P2_inter pour M2
         for a in range(100, 150):
             k = a - 99
             if self.stock.p2_inter < k:
@@ -156,7 +220,33 @@ class WorkshopEnv(gym.Env):
         reward = 0.0
 
         # -----------------------------------------------------------
-        # 1) TRAITEMENT DE L'ACTION
+        # 1) DECODE DE L'ACTION POUR LES VARIABLES D'ÉTAT
+        # -----------------------------------------------------------
+        self.current_action_id = int(action)
+
+        if action == 200:
+            self.current_action_type = 4
+            self.current_action_k = 0
+        elif 0 <= action <= 49:
+            self.current_action_type = 0
+            self.current_action_k = action + 1
+        elif 50 <= action <= 99:
+            self.current_action_type = 1
+            self.current_action_k = action - 49
+        elif 100 <= action <= 149:
+            self.current_action_type = 2
+            self.current_action_k = action - 99
+        elif 150 <= action <= 199:
+            self.current_action_type = 3
+            self.current_action_k = action - 149
+        else:
+            # Sécurité si action hors bornes
+            self.current_action_type = 4
+            self.current_action_k = 0
+            self.current_action_id = 200
+
+        # -----------------------------------------------------------
+        # 2) TRAITEMENT DE L'ACTION (REWARD COMME AVANT)
         # -----------------------------------------------------------
 
         # Action WAIT
@@ -203,7 +293,7 @@ class WorkshopEnv(gym.Env):
             self.delivery.schedule(k, arrival_time)
 
         # -----------------------------------------------------------
-        # 2) PRODUCTION AU FIL DE L'EAU — MACHINE M1
+        # 3) PRODUCTION AU FIL DE L'EAU — MACHINE M1
         # -----------------------------------------------------------
         res_m1 = self.m1.tick()
 
@@ -217,7 +307,7 @@ class WorkshopEnv(gym.Env):
                 self.m1.reset_after_batch()
 
         # -----------------------------------------------------------
-        # 3) PRODUCTION AU FIL DE L'EAU — MACHINE M2
+        # 4) PRODUCTION AU FIL DE L'EAU — MACHINE M2
         # -----------------------------------------------------------
         res_m2 = self.m2.tick()
 
@@ -229,19 +319,19 @@ class WorkshopEnv(gym.Env):
                 self.m2.reset_after_batch()
 
         # -----------------------------------------------------------
-        # 4) LIVRAISONS DE MP
+        # 5) LIVRAISONS DE MP
         # -----------------------------------------------------------
         delivered = self.delivery.tick(self.time)
         if delivered > 0:
             self.stock.add_raw(delivered)
 
         # -----------------------------------------------------------
-        # 5) INCRÉMENT DU TEMPS
+        # 6) INCRÉMENT DU TEMPS
         # -----------------------------------------------------------
         self.time += 1
 
         # -----------------------------------------------------------
-        # 6) DEMANDE + VENTES — toutes les 15 minutes
+        # 7) DEMANDE + VENTES — toutes les 15 minutes
         # -----------------------------------------------------------
         if self.time % 15 == 0:
 
@@ -258,31 +348,36 @@ class WorkshopEnv(gym.Env):
             self.demande_p1 -= sold_p1
             self.demande_p2 -= sold_p2
 
-            # -----------------------------------------------------------
-            # PÉNALITÉ BACKLOG — CHAQUE MINUTE
-            # -----------------------------------------------------------
+            # Pénalité backlog (logique inchangée)
             backlog = self.demande_p1 + self.demande_p2
             reward -= 0.02 * float(backlog)
 
         # -----------------------------------------------------------
-        # 7) VOL QUOTIDIEN (minute 1435)
+        # 8) VOL QUOTIDIEN (minute 1435)
         # -----------------------------------------------------------
         if self.time % 1440 == self.theft_time:
             self.market.apply_theft(self.stock)
 
+        # -----------------------------------------------------------
+        # 9) MISE À JOUR DES REWARDS CUMULÉS POUR L'ÉTAT
+        # -----------------------------------------------------------
+        self.week_reward += reward
+        self.reward_current_action = reward
 
         # -----------------------------------------------------------
-        # 8) TERMINAISON
+        # 10) TERMINAISON
         # -----------------------------------------------------------
         terminated = self.time >= self.max_time
-
-        return self._get_obs(), reward, terminated, False, {}
+        truncated = False
+        return self._get_obs(), reward, terminated, truncated, {}
 
     # ================================================================
-    # CONSTRUCTION DE L'OBSERVATION POUR SB3
+    # CONSTRUCTION DE L'OBSERVATION POUR SB3 (23 DIMENSIONS)
+    # AVEC NORMALISATION DES VARIABLES
     # ================================================================
     def _get_obs(self):
 
+        # Infos sur la prochaine livraison
         if self.delivery.queue:
             next_t = min(t for (q, t) in self.delivery.queue)
             next_delivery_countdown = max(next_t - self.time, 0)
@@ -291,18 +386,59 @@ class WorkshopEnv(gym.Env):
             next_delivery_countdown = 0
             q_total = 0
 
-        return np.array([
-            float(self.time),
-            float(self.m1.busy),
-            float(self.m1.time_left),
-            float(self.m2.busy),
-            float(self.m2.time_left),
-            float(self.stock.raw),
-            float(self.stock.p1),
-            float(self.stock.p2_inter),
-            float(self.stock.p2),
-            float(next_delivery_countdown),
-            float(self.demande_p1),
-            float(self.demande_p2),
-            float(q_total)
+        # minute dans la journée
+        minute_of_day = self.time % 1440
+
+        # reward potentiel lié au backlog (simple rescaling)
+        expected_dem_p1_next = 2.0 * float(self.demande_p1)
+        expected_dem_p2_next = 20.0 * float(self.demande_p2)
+
+        # niveau de risque de vol (par exemple : dans l'heure avant le vol)
+        minutes_in_day = self.time % 1440
+        if 0 <= (self.theft_time - minutes_in_day) <= 60:
+            theft_risk_level = 1.0
+        else:
+            theft_risk_level = 0.0
+
+        # temps jusqu'à la prochaine vente (toutes les 15 minutes)
+        time_mod_15 = self.time % 15
+        time_to_next_sell = 0 if time_mod_15 == 0 else 15 - time_mod_15
+
+        # ============================
+        # NORMALISATION (DIVISION)
+        # ============================
+
+        obs = np.array([
+            float(self.time) / float(self.max_time),        # 0: time normalisé [0,1]
+            float(self.m1.busy),                            # 1: déjà dans {0,1}
+            float(self.m1.time_left) / 100.0,               # 2
+            float(self.m2.busy),                            # 3
+            float(self.m2.time_left) / 100.0,               # 4
+
+            float(self.stock.raw) / float(self.raw_capacity),     # 5
+            float(self.stock.p1) / float(self.raw_capacity),      # 6
+            float(self.stock.p2_inter) / float(self.raw_capacity),# 7
+            float(self.stock.p2) / float(self.raw_capacity),      # 8
+
+            float(next_delivery_countdown) / 10080.0,       # 9
+
+            float(self.demande_p1) / 1000.0,                # 10
+            float(self.demande_p2) / 1000.0,                # 11
+            float(q_total) / 1000.0,                        # 12
+
+            float(self.current_action_type) / 4.0,          # 13
+            float(self.current_action_k) / 50.0,            # 14
+            float(self.current_action_id) / 200.0,          # 15
+
+            float(minute_of_day) / 1440.0,                  # 16
+
+            float(expected_dem_p1_next) / 2000.0,           # 17
+            float(expected_dem_p2_next) / 20000.0,          # 18
+            float(theft_risk_level),                        # 19, déjà 0 ou 1
+
+            float(self.week_reward) / 1_000_000.0,          # 20
+            float(self.reward_current_action) / 100_000.0,  # 21
+            float(time_to_next_sell) / 15.0                 # 22
         ], dtype=np.float32)
+
+        return obs

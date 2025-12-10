@@ -1,247 +1,298 @@
-# Rapport d'avancement — Atelier de production (Version DQN, environnement final)
 
-Ce document décrit l'état **corrigé et à jour** de l'environnement d'atelier industriel utilisé pour l'apprentissage par renforcement (DQN) dans le projet.
+# README — Atelier de Production (Version RL avancée, 23 variables)
 
-Il est désormais **aligné** avec la spécification officielle :
-`workshop_environment_specification.md`.
-
----
-
-## 1. Objectif de l'environnement
-
-L'environnement simule un **atelier industriel multitâche** dans lequel un agent doit :
-- planifier la production sur deux machines,
-- gérer un **carnet de commandes (backlog)** mis a jour toutes les 15 minutes,
-- commander de la matière première avec délai (environ 120 minutes),
-- maintenir les stocks à un niveau pertinent malgré un **vol nocturne** (11:55 pm),
-- maximiser le revenu sur un horizon de **7 jours (10080 minutes)**.
-
-L'agent sera entraîné avec un algorithme de type **DQN avec SB3** sur un environnement Gymnasium personnalisé (`WorkshopEnv`).
+Ce document décrit l'état **corrigé, actualisé et entièrement aligné** avec la dernière version de la spécification officielle de l’environnement Workshop (23 variables).  
+Cette version remplace complètement l’ancien README basé sur 13 variables.  
+Référence : *workshop_environnement_specification.md*.
 
 ---
 
-## 2. Structure globale du code
+# 1. Objectif général
 
-L'environnement est organisé en plusieurs modules :
+L’environnement simule un **atelier industriel multitâche** dans lequel un agent RL doit :
 
-```text
+- planifier la production de deux produits (P1, P2) répartis sur **deux machines indépendantes** ;
+- gérer un **carnet de commandes résiduel (backlog)** mis à jour toutes les 15 minutes ;
+- commander de la matière première (MP) avec délai (120 ± 2 minutes) ;
+- maintenir des niveaux de stocks pertinents malgré un **vol nocturne quotidien** ;
+- maximiser le **reward cumulé sur 7 jours (10080 minutes)**.
+
+L’agent peut utiliser DQN, PPO, MaskablePPO ou tout autre algorithme compatible Gymnasium.
+
+---
+
+# 2. Structure du code (modules)
+
+```
 env/
 │
-├── machines.py       → logique des machines M1 et M2 (batches asynchrones)
-├── stock.py          → gestion des stocks (MP, P1, P2_inter, P2)
-├── delivery.py       → file d'attente de livraisons de matière première
-├── market.py         → génération de la demande + calcul des ventes
-└── workshop_env.py   → environnement Gymnasium complet (classe WorkshopEnv)
+├── machines.py         → logique Machine M1/M2, batches asynchrones
+├── stock.py            → gestion des stocks P1 / P2 / MP / P2_inter
+├── delivery.py         → file FIFO de livraisons de matières premières
+├── market.py           → génération demande, backlog, ventes
+└── workshop_env.py     → environnement RL complet Gymnasium (23 variables)
 ```
 
+Tous ces modules collaborent pour produire une simulation cohérente et réaliste.
 
 ---
 
-## 3. Horizon temporel et dynamique
+# 3. Dynamique temporelle
 
 - **1 step = 1 minute**
 - **1 journée = 1440 minutes**
 - **1 épisode = 7 jours = 10080 steps**
+- **Ventes : toutes les 15 minutes**
+- **Vol nocturne : minute 1435 chaque jour**
 
 À chaque step :
 
-1. L'agent choisit une action.
-2. Les machines avancent d'une minute (si elles sont occupées).
-3. Les éventuels batches terminés mettent à jour les stocks.
-4. Les livraisons de MP prévues pour cette minute sont ajoutées au stock.
-5. Toutes les **15 minutes**, une nouvelle demande est générée et les ventes sont calculées.
-6. Toutes les **1440 minutes**, un vol nocturne réduit les stocks de P1 et P2.
-7. Un nouvel état (13 variables) et un reward sont renvoyés à l'agent.
-
-L'épisode se termine lorsque `time >= 10080`.
+1. L’agent choisit une action parmi 201.
+2. Les machines avancent d’une minute.
+3. Les productions terminées ajoutent des unités instantanément.
+4. Les livraisons planifiées arrivent si leur minute correspond.
+5. Toutes les 15 minutes : demande → backlog → ventes → reward.
+6. Si minute 1435 : vol sur P1 et P2.
+7. L’environnement renvoie l’observation (23 valeurs), le reward et terminated/truncated.
 
 ---
 
-## 4. Composants principaux
+# 4. Machines — Production multi-étapes
 
-### 4.1 Machines (machines.py)
+## M1
+- Produit **P1** : durée `3 × k`
+- Produit **P2_step1** : durée `10 × k`
 
-- **M1** :
-  - Produit P1 (à partir de MP) : durée d'un batch de taille k = `3 × k` minutes
-  - Produit P2_inter (étape 1 de P2) : durée = `10 × k` minutes
+## M2
+- Produit **P2_step2** : durée `15 × k`
 
-- **M2** :
-  - Produit P2 (à partir de P2_inter) : durée d'un batch de taille k = `15 × k` minutes
+### Production « au fil de l’eau »
+Les machines produisent **une unité par minute**, pas uniquement à la fin du batch.
 
-Les machines ont un état interne (`busy`, `time_left`, `batch_type`, `batch_k`) et sont mises à jour via une méthode `tick()` appelée chaque minute.
+---
 
-### 4.2 Stocks (stock.py)
+# 5. Stocks
 
-Stocks gérés :
-- `stock_raw` : matière première (MP)
-- `stock_p1` : produit fini P1
-- `stock_p2_inter` : produit intermédiaire P2
-- `stock_p2` : produit fini P2
+- MP (`stock_raw`)
+- P1 (`stock_p1`)
+- P2 intermédiaire (`stock_p2_inter`)
+- P2 final (`stock_p2`)
 
-Les méthodes permettent de consommer / ajouter du stock en respectant des bornes logiques (≈ 50 unités).
+Chaque stock est borné logiquement autour de 50 unités.
 
-### 4.3 Livraisons (delivery.py)
+---
 
-- Les commandes de MP sont planifiées avec un **délai d'environ 120 minutes**.
-- Chaque commande est stockée comme `(quantité, time_livraison)` dans une file FIFO.
-- À chaque minute, les livraisons arrivées sont retirées de la file et ajoutées à `stock_raw`.
+# 6. Commandes de matières premières (MP)
 
-L'observation inclut :
-- le **temps restant avant la prochaine livraison**,
-- la **quantité totale de MP en transit** (somme de toutes les livraisons futures).
+Actions **150 à 199** :
 
-### 4.4 Marché et demande (market.py)
-
-La demande n'est plus ponctuelle, mais modélisée comme un **backlog** (carnet de commandes non servies).
-
-- Une fois par quart d'heure (`time % 15 == 0`), on génère une **nouvelle demande horaire** pour P1 et P2 :
-  - la demande dépend de l'heure de la journée (**profil jour/nuit**),
-  - elle suit une loi de Poisson agrégée sur 60 minutes.
-
-- Cette nouvelle demande est **ajoutée au backlog** :
-  ```python
-  backlog_p1 += new_d1
-  backlog_p2 += new_d2
-  ```
-
-- Puis on calcule les ventes possibles à partir des stocks disponibles :
-  ```python
-  ventes_p1 = min(stock_p1, backlog_p1)
-  ventes_p2 = min(stock_p2, backlog_p2)
-  ```
-
-- Le backlog est mis à jour :
-  ```python
-  backlog_p1 -= ventes_p1
-  backlog_p2 -= ventes_p2
-  ```
-
-- Le reward associé aux ventes est :
-  ```python
-  reward += 2 * ventes_p1 + 20 * ventes_p2
-  ```
-
-La demande visible par l'agent dans l'état est donc **la demande résiduelle** (backlog), pas la demande brute de la dernière heure.
-
-### 4.5 Vol nocturne
-
-Toutes les **1440 minutes** (fin de journée a 11:55pm) :
-
-```python
-stock_p1 = floor(stock_p1 * 0.9)
-stock_p2 = floor(stock_p2 * 0.9)
+```
+q = action - 149
+coût immédiat = -q
+livraison dans 120 ± 2 minutes
 ```
 
-Seuls les stocks de P1 et P2 sont affectés.  
-Ce mécanisme pénalise les stocks excessifs de produits finis et incite à une production mieux synchronisée avec le backlog.
+Livraisons gérées par une file FIFO.
 
 ---
 
-## 5. Espace d'actions (WorkshopEnv)
+# 7. Demande, backlog et ventes
 
-L’espace d’actions est :
-```python
-self.action_space = spaces.Discrete(201)
+### Demande
+Toutes les 15 minutes, génération jour/nuit de `(new_d1, new_d2)` qui sont ajoutées au backlog.
+
+### Backlog résiduel
+Le backlog représente la **demande non servie**, jamais remis à zéro.
+
+### Ventes
+```
+sold_p1 = min(stock_p1, backlog_p1)
+sold_p2 = min(stock_p2, backlog_p2)
+reward += 2 * sold_p1 + 20 * sold_p2
+backlog -= sold
 ```
 
-Signification des actions :
-
-| Actions     | Effet                                       |
-|-------------|---------------------------------------------|
-| 0 à 49      | Produire P1, avec k = action + 1            |
-| 50 à 99     | Produire P2 (étape 1, M1), k = action − 49  |
-| 100 à 149   | Produire P2 (étape 2, M2), k = action − 99  |
-| 150 à 199   | Commander MP, quantité q = action − 149     |
-| **200**     | **WAIT** (ne rien faire)                    |
-
-Règles de validité :
-- Si une machine est déjà occupée, une tentative de production sur cette machine devient **WAIT**.
-- Si le stock de MP / P2_inter est insuffisant, l’action de production devient **WAIT**.
-- Les actions hors `[0, 200]` lèvent une erreur.
+### Pénalité backlog
+```
+reward -= 0.02 * (backlog_p1 + backlog_p2)
+```
 
 ---
 
-## 6. Espace d’observation (WorkshopEnv)
+# 8. Vol nocturne
 
-L’observation est un vecteur de taille **13** :
+Chaque jour à minute 1435 :
+```
+stock_p1 = floor(0.9 * stock_p1)
+stock_p2 = floor(0.9 * stock_p2)
+```
 
-1. `time` : minute courante (0 à 10080)
-2. `m1_busy` : 0/1
-3. `m1_time_left` : temps restant sur le batch M1
-4. `m2_busy` : 0/1
-5. `m2_time_left` : temps restant sur le batch M2
-6. `stock_raw` : stock de MP
-7. `stock_p1` : stock de P1
-8. `stock_p2_inter` : stock intermédiaire P2
-9. `stock_p2` : stock de P2
-10. `next_delivery_countdown` : minutes restantes avant la prochaine livraison de MP (0 s’il n’y en a pas)
-11. `backlog_p1` : demande résiduelle (carnet de commandes P1 non servies)
-12. `backlog_p2` : demande résiduelle (carnet de commandes P2 non servies)
-13. `q_total_en_route` : quantité totale de MP en transit (commandée mais non livrée)
-
-Cet état est conçu pour être **Markovien** : l’agent dispose de toutes les informations nécessaires pour prendre des décisions optimales sans mémoire externe.
+Une variable d’état (`theft_risk_level`) indique la proximité de l’événement.
 
 ---
 
-## 7. Reward
+# 9. Espace d’actions (201 actions)
 
-Le reward par step peut inclure :
+| Actions | Signification | k |
+|--------|---------------|---|
+| 0–49 | P1 sur M1 | k = a + 1 |
+| 50–99 | P2 step1 sur M1 | k = a − 49 |
+| 100–149 | P2 step2 sur M2 | k = a − 99 |
+| 150–199 | Commander MP | k = a − 149 |
+| 200 | WAIT | 0 |
 
-- **revenu des ventes** (uniquement à l’heure pleine) :
-  - `+ 2 * ventes_p1`
-  - `+ 20 * ventes_p2`
-- **coût des commandes de MP** :
-  - `− q` lors d’une action de commande
-- pénalité explicite appliquee sur le backlog 
-
----
-
-## 8. Utilisation avec DQN
-
-L’environnement `WorkshopEnv` est compatible Gymnasium et peut être utilisé avec un agent DQN (par exemple via Stable-Baselines3) :
-
-- action space : `Discrete(201)`
-- observation : vecteur `np.array` de taille 13 (`dtype=float32`)
-- horizon long : 10080 steps / épisode
-- reward non trivial : combinaison ventes − coûts − vol
-
-Il est recommandé :
-
-- de normaliser les observations (time, stocks, backlog),
-- de suivre, en plus du reward :
-  - l’évolution moyenne du backlog,
-  - le taux de satisfaction de la demande,
-  - l’utilisation des machines,
-  - l’évolution des stocks de P1 / P2.
+Actions impossibles → WAIT et pénalité.
 
 ---
 
+# 10. Observation — **23 variables**
+
+Les 13 premières variables correspondent à l’ancien état.  
+Les 10 suivantes enrichissent fortement le contexte temporel, commercial et actionnel.
+
+### 10.1 Anciennes variables (0–12)
+
+1. time  
+2. m1_busy  
+3. m1_time_left  
+4. m2_busy  
+5. m2_time_left  
+6. stock_raw  
+7. stock_p1  
+8. stock_p2_inter  
+9. stock_p2  
+10. next_delivery_countdown  
+11. backlog_p1  
+12. backlog_p2  
+13. q_total_en_route  
+
+### 10.2 Nouvelles variables (13–22)
+
+| idx | Nom | Description |
+|-----|------|-------------|
+| 13 | current_action_type | (0=P1, 1=P2_step1, 2=P2_step2, 3=command, 4=WAIT) |
+| 14 | current_action_k | quantité produite/commandée |
+| 15 | current_action_id | action brute ∈ [0,200] |
+| 16 | minute_of_day | time mod 1440 |
+| 17 | expected_dem_p1_next | 2 × backlog_p1 |
+| 18 | expected_dem_p2_next | 20 × backlog_p2 |
+| 19 | theft_risk_level | 0/1 selon proximité du vol |
+| 20 | reward_current_week | reward cumulatif |
+| 21 | reward_current_action | reward du dernier step |
+| 22 | time_to_next_sell | minutes restantes avant prochaine vente |
+
+---
+
+# 11. Reward
+
+- +2 × ventes P1  
+- +20 × ventes P2  
+- − backlog × 0.02  
+- +0.5 × k pour batch P1  
+- +5 × k pour batch P2_step1  
+- +15 × k pour batch P2_step2  
+- −q pour commandes MP  
+- −0.2 pour WAIT  
+- −1 si action impossible  
+
+---
+
+# 12. Compatibilité RL
+
+Compatible **Gymnasium**, utilisable avec :
+
+- SB3 (DQN, PPO, MaskablePPO)
+- Ray RLlib
+- CleanRL
+
+Recommandations :
+
+- normalisation des observations,
+- monitoring backlog + stocks,
+- analyser les rewards cumulés/semaine,
+- utiliser des action masks.
+
+---
+
+# 13. Résumé
+
+Cette nouvelle version **23 variables** :
+
+- fournit un état véritablement Markovien riche,
+- améliore la compréhension temporelle et la gestion du risque,
+- relie backlog ↔ reward potentiel,
+- expose explicitement la dernière action et son impact,
+- permet un RL plus performant et plus stable.
+
+Elle constitue désormais **LA version officielle du Workshop Environment**.
 
 
 
+---
 
-## 9. Vérification complète de l’environnement avec le notebook `Workshop_Test`
+## Normalisation des variables d’observation
 
-L’ensemble des tests décrits ci-dessous provient du fichier : Workshop_Test.py. Ils valident toutes les dynamiques essentielles de l’environnement, de la production aux livraisons, en passant par les ventes, le backlog et le vol nocturne.
+Dans la version actuelle de `WorkshopEnv` (23 variables), **toutes les composantes du vecteur d’observation sont normalisées** avant d’être renvoyées à l’agent RL.  
+L’objectif est d’obtenir des valeurs numériques de même ordre de grandeur (typiquement dans `[0, 1]`) afin de :
 
-### 9.1 Production P1 (k = 3)
-Vérification du fonctionnement de M1 avec un batch de taille 3, durée correcte (3×k), mise à jour du stock et progression temporelle valide.
+- stabiliser l’optimisation (PPO, DQN, etc.) ;
+- éviter que certaines features dominent les autres uniquement par leur échelle ;
+- faciliter l’agrégation de données pour DAgger et l’apprentissage supervisé.
 
-### 9.2 Production P2 (STEP1 → STEP2)
-Contrôle du flux complet P2 : STEP1 sur M1 puis STEP2 sur M2, consommations et productions correctes, cohérence des états machines.
+De façon générale :
 
-### 9.3 Production P2 multiple (k = 3)
-Validation de la cohérence temporelle et du flux matière pour un batch plus large (k=3).
+- le temps courant est divisé par `max_time` (7 jours en minutes) ;
+- les temps restants sur machines sont divisés par une borne maximale fixe (par exemple 100 minutes) ;
+- les stocks (MP, P1, P2_inter, P2) sont divisés par leur capacité maximale théorique ;
+- les backlogs sont divisés par `1000` (borne haute choisie pour les demandes) ;
+- la quantité de MP en livraison (`q_raw_incoming`) est divisée par `1000` ;
+- certaines grandeurs de type « score cumulé » (ex. `week_reward`) sont, quand elles sont exposées, divisées par une borne large (par ex. `1e6`).
 
-### 9.4 Vol nocturne
-Test du mécanisme de réduction des stocks de P1 et P2 à t mod 1440 = 1435, sans impact sur MP ou P2_inter.
+Cette normalisation est réalisée directement dans la méthode `_get_obs()` de `workshop_env.py`.  
+Elle ne change pas la dynamique interne de l’atelier (les variables internes restent en unités « réelles ») mais **uniquement la représentation vue par l’agent RL**.
 
-### 9.5 Livraisons multiples avec jitter
-Tests de commandes successives de MP : délais 120±2, FIFO respectée, aucune livraison écrasée.
+En pratique, cette étape :
 
-### 9.6 Livraison + vente simultanée
-Cas critique : livraison tombant exactement à une heure pleine (t=120). Vérification que la vente ne touche jamais au stock MP, cohérence backlog/ventes.
+- rend l’entraînement MaskablePPO plus stable,
+- facilite l’utilisation d’un même environnement pour DAgger (imitation supervisée) et PPO,
+- prépare le terrain pour des variantes de modèles (réseaux plus profonds, autres algos RL).
 
-### 9.7 Livraison + vente + vol nocturne
-Superposition des événements critiques proches de minuit : livraisons, vente (t=1440), vol (t=1435). Aucune interaction indésirable.
+---
 
+## Synthèse des expériences DAgger + MaskablePPO (notebook `dagger_hybrid`)
+
+Un notebook séparé, `dagger_hybrid`, explore un pipeline complet :
+
+1. **Masque d’actions** : usage systématique de `env.get_action_mask()` et de `MaskablePPO` pour interdire les actions impossibles.
+2. **Expert v2** : politique heuristique très performante, obtenant un reward d’environ **+12 729** sur un épisode de 7 jours avec les 23 variables normalisées.
+3. **DAgger (Dataset Aggregation)** : apprentissage supervisé de l’élève sur les trajectoires expertes, puis collecte de nouvelles données où l’élève joue et l’expert corrige.
+4. **PPO** : dans la version complète, PPO doit affiner la politique après l’imitation. Dans la phase de diagnostic décrite ici, **PPO a été désactivé** pour isoler le comportement de DAgger.
+
+Les résultats clés observés à partir des cellules 4 et 10 du notebook sont :
+
+- Dataset expert initial :  
+  - `obs shape : (10080, 23)`  
+  - `actions shape : (10080,)`  
+  - `Reward expert : 12729.30` (7 jours, 10080 steps)
+
+- DAgger imitation seule (PPO désactivé) sur deux itérations :
+  - la CrossEntropyLoss diminue légèrement (≈ 5.26 → 4.16) mais reste très élevée ;
+  - les rewards de l’élève restent fortement négatifs (entre **-6300** et **-5900** sur 7 jours) ;
+  - même après agrégation de 30 240 exemples, l’élève n’approche pas le niveau de l’expert.
+
+**Conclusion du diagnostic :**
+
+- le masque d’actions et l’expert v2 fonctionnent correctement ;
+- le problème observé ne vient pas de PPO (mis de côté dans cette phase) ;
+- l’échec de DAgger dans cette configuration vient principalement de la **difficulté de l’élève à approximer la politique experte à partir des 23 variables d’observation**, dont une partie est redondante ou peu informative pour la décision.
+
+**Piste de travail identifiée :**
+
+La prochaine étape consiste à **réduire le vecteur d’observation** exposé à l’élève, en se concentrant sur un sous-ensemble de variables réellement utilisées par l’expert (état des machines, stocks, backlogs, livraisons MP, etc.).  
+L’objectif est de rendre la tâche d’imitation plus simple et mieux conditionnée, puis de :
+
+1. relancer DAgger en mode imitation seule avec ce vecteur réduit ;
+2. une fois l’élève capable d’imiter correctement l’expert, réactiver PPO dans la boucle ;
+3. éventuellement réintroduire certaines variables supplémentaires si elles apportent un gain mesurable.
+
+Ce README, combiné au rapport détaillé `dagger_hybrid_report.md`, sert de référence globale pour l’état actuel de l’environnement Workshop et des premières expérimentations RL avancées.
