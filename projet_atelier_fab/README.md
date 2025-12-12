@@ -82,6 +82,7 @@ Notebooks dédiés :
 - `ppo_finetune` (evaluation du modele dagger)
 - `analyse_dagger` (courbes d'entrainement) 
 
+Synthese du contenu de  `dagger_hybrid` :
 - génération de trajectoires expertes,
 - apprentissage supervisé,
 - collecte itérative avec corrections expertes,
